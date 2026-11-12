@@ -6,8 +6,8 @@ COPY . /app
 
 RUN pip install --upgrade pip \
     && pip install uv \
-    && uv sync
+    && uv sync --frozen --no-dev
 
 EXPOSE 8000
 
-CMD ["uv", "run", "--directory", "/app", "-m", "mcp_redmine.server", "--transport", "streamable-http"]
+CMD ["/app/.venv/bin/python", "-m", "mcp_redmine.server", "--transport", "streamable-http"]
