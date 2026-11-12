@@ -113,6 +113,7 @@ Add to your `claude_desktop_config.json`:
 | `REDMINE_REQUEST_INSTRUCTIONS` | No | - | Path to a file containing additional instructions for the redmine_request tool. I've found it works great to have the LLM generate that file after a session. ([example1](INSTRUCTIONS_EXAMPLE1.md) [example2](INSTRUCTIONS_EXAMPLE2.md)) |
 | `REDMINE_HEADERS` | No | (empty) | Custom HTTP headers to include in all requests. Format: `"Header1: Value1, Header2: Value2"`. Useful for proxies that require additional authentication (e.g., `X-Redmine-Username`) |
 | `REDMINE_RESPONSE_FORMAT` | No | `yaml` | Response format: `yaml` or `json`. Controls how API responses are formatted |
+| `REDMINE_PROJECT` | No | (none) | Default project id or identifier for the curated tools. When set, `project` can be omitted on search/create/log-time; pass `project: "all"` to span every project |
 | `REDMINE_ALLOWED_DIRECTORIES` | For upload/download | (disabled) | **Required for file operations.** Comma-separated list of directories where upload/download are allowed (e.g., `/tmp,/home/user/uploads`). Upload/download are disabled if not set for security |
 | `REDMINE_DANGEROUSLY_ACCEPT_INVALID_CERTS` | No | (disabled) | Set to `1` to disable SSL certificate verification. Use only for self-signed certs in trusted environments |
 
@@ -133,6 +134,19 @@ Add to your `claude_desktop_config.json`:
 ## API
 
 ### Tools
+
+The curated tools cover the common Redmine work with typed arguments and accept names (`"In Progress"`, `"Bug"`,
+`"High"`, `"me"`) wherever Redmine wants a numeric id. `redmine_request` remains the escape hatch for everything
+they do not cover.
+
+- **redmine_metadata** — statuses, trackers, priorities, activities, current user and the default project
+- **redmine_search_issues** — filter by text, project, status, assignee, tracker, priority
+- **redmine_get_issue** — one issue with journals, attachments and relations
+- **redmine_create_issue** — create, resolving tracker/priority/assignee names
+- **redmine_update_issue** — edit fields and/or append a note
+- **redmine_log_time** — log hours on an issue or project
+- **redmine_list_projects** — id, identifier and name of visible projects
+
 
 - **redmine_paths_list**
   - Return a list of available API paths from OpenAPI spec
@@ -261,7 +275,7 @@ Then set this in claude_desktop_config.json:
 ```
 ...
 "command": "uv",
-"args": ["run", "--directory", "/path/to/mcp-redmine", "-m", "mcp_redmine.server", "main"],
+"args": ["run", "--directory", "/path/to/mcp-redmine", "-m", "mcp_redmine.server"],
 ...
 ```
 

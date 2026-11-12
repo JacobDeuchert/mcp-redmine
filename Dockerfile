@@ -8,4 +8,6 @@ RUN pip install --upgrade pip \
     && pip install uv \
     && uv sync
 
-CMD ["uv", "run", "--directory", "/app", "-m", "mcp_redmine.server", "main"]
+EXPOSE 8000
+
+CMD ["uv", "run", "--directory", "/app", "-m", "mcp_redmine.server", "--transport", "streamable-http"]

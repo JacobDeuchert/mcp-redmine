@@ -1,4 +1,4 @@
-import os, yaml, pathlib, json, uuid
+import os, yaml, pathlib, json, uuid, threading
 from urllib.parse import urljoin
 
 import httpx
@@ -18,6 +18,9 @@ with open(current_dir / 'redmine_openapi.yml') as f:
 REDMINE_URL = os.environ['REDMINE_URL'].rstrip('/') + '/'  # Normalize to always end with /
 REDMINE_API_KEY = os.environ['REDMINE_API_KEY']
 REDMINE_RESPONSE_FORMAT = os.environ.get('REDMINE_RESPONSE_FORMAT', 'yaml').lower()
+
+# Default project for curated tools (id or identifier). Empty means no default.
+REDMINE_PROJECT = os.environ.get('REDMINE_PROJECT', '').strip()
 
 # Custom headers (format: "Header1: Value1, Header2: Value2")
 REDMINE_HEADERS = {}
@@ -123,9 +126,78 @@ def validate_path(file_path: str, must_exist: bool = True) -> tuple[str | None, 
 
     return None, path
 
+# Metadata lookups (lazily fetched once per process, shared across all clients)
+METADATA_SOURCES = {
+    'status': ('issue_statuses.json', 'issue_statuses'),
+    'tracker': ('trackers.json', 'trackers'),
+    'priority': ('enumerations/issue_priorities.json', 'issue_priorities'),
+    'activity': ('enumerations/time_entry_activities.json', 'time_entry_activities'),
+}
+METADATA_CACHE = {}
+METADATA_LOCK = threading.Lock()
+
+
+def metadata(kind: str) -> list:
+    """Return [{id, name}, ...] for an enumeration, cached. Empty list if Redmine is unreachable."""
+    if kind in METADATA_CACHE:
+        return METADATA_CACHE[kind]
+
+    with METADATA_LOCK:
+        if kind in METADATA_CACHE:
+            return METADATA_CACHE[kind]
+
+        path, key = METADATA_SOURCES[kind]
+        response = request(path)
+        if response["status_code"] != 200 or not isinstance(response["body"], dict):
+            return []  # Not cached, so a later call retries
+
+        METADATA_CACHE[kind] = response["body"].get(key, [])
+        return METADATA_CACHE[kind]
+
+
+def resolve(kind: str, value) -> tuple[str | None, int | None]:
+    """Resolve a name or numeric id to an id. Returns (error, id); (None, None) when value is None."""
+    if value is None:
+        return None, None
+
+    text = str(value).strip()
+    if text.isdigit():
+        return None, int(text)
+
+    for item in metadata(kind):
+        if item.get("name", "").lower() == text.lower():
+            return None, item["id"]
+
+    known = ", ".join(item.get("name", "") for item in metadata(kind)) or "none available"
+    return f"Unknown {kind}: {value!r}. Known {kind}s: {known}", None
+
+
+def resolve_user(value) -> tuple[str | None, int | str | None]:
+    """Resolve a user id or the literal 'me' to a user id."""
+    if value is None:
+        return None, None
+
+    text = str(value).strip()
+    if text.isdigit():
+        return None, int(text)
+    if text.lower() == "me":
+        response = request("users/current.json")
+        if response["status_code"] != 200:
+            return f"Could not resolve 'me': {response['error'] or response['status_code']}", None
+        return None, response["body"]["user"]["id"]
+
+    return f"User must be a numeric id or 'me', got {value!r}", None
+
+
+def resolve_project(project) -> str | None:
+    """Explicit project wins, else REDMINE_PROJECT. 'all' clears the default. None means all projects."""
+    value = str(project if project is not None else REDMINE_PROJECT).strip()
+    return None if not value or value.lower() == "all" else value
+
+
 
 # Tools
-mcp = FastMCP("Redmine MCP server")
+mcp = FastMCP("Redmine MCP server", stateless_http=True, json_response=True)
 get_logger(__name__).info(f"Starting MCP Redmine version {VERSION}")
 
 @mcp.tool(description="""
@@ -249,17 +321,261 @@ def redmine_download(attachment_id: int, save_path: str, filename: str = None) -
     except Exception as e:
         return format_response({"status_code": 0, "body": None, "error": f"{e.__class__.__name__}: {e}"})
 
+# Curated tools
+PROJECT_NOTE = (
+    f"Optional, defaults to the configured project {REDMINE_PROJECT!r}. Pass 'all' to span every project."
+    if REDMINE_PROJECT else
+    "Optional project id or identifier. Omitted means every project."
+)
+
+
+@mcp.tool()
+def redmine_metadata() -> str:
+    """Get the issue statuses, trackers, priorities and time entry activities of this Redmine instance
+
+    Call this once before creating or updating issues so names map to the right ids. The curated tools accept
+    names directly, so this is mainly useful for knowing which values exist.
+
+    Returns:
+        str: YAML string with the available enumerations, the current user and the default project
+    """
+    body = {kind: [{"id": i["id"], "name": i.get("name")} for i in metadata(kind)] for kind in METADATA_SOURCES}
+    body["default_project"] = REDMINE_PROJECT or None
+
+    current = request("users/current.json")
+    if current["status_code"] == 200:
+        body["current_user"] = {k: current["body"]["user"].get(k) for k in ("id", "login", "firstname", "lastname")}
+
+    return wrap_insecure_content(format_response({"status_code": 200, "body": body, "error": ""}))
+
+
+@mcp.tool(description="""
+Search issues with the common filters
+
+Args:
+    query: Text to match against the issue subject (substring match)
+    project: {}
+    status: 'open' (default), 'closed', 'all', or a status name/id such as 'In Progress'
+    assigned_to: User id or 'me'
+    tracker: Tracker name or id, e.g. 'Bug'
+    priority: Priority name or id, e.g. 'High'
+    sort: Sort order (default 'updated_on:desc')
+    limit: Max issues to return, capped at 100 (default 25)
+    offset: Pagination offset
+
+Returns:
+    str: YAML string containing response status code, body and error message
+""".format(PROJECT_NOTE).strip())
+def redmine_search_issues(query: str = None, project: str = None, status: str = "open", assigned_to: str = None,
+                          tracker: str = None, priority: str = None, sort: str = "updated_on:desc",
+                          limit: int = 25, offset: int = 0) -> str:
+    params = {"limit": max(1, min(limit, 100)), "offset": offset, "sort": sort}
+
+    if project_id := resolve_project(project):
+        params["project_id"] = project_id
+    if query:
+        params["subject"] = f"~{query}"
+
+    # 'open'/'closed'/'all' are Redmine's own filter values; anything else is a status name or id
+    status_text = (status or "open").strip().lower()
+    if status_text in ("open", "closed"):
+        params["status_id"] = status_text
+    elif status_text not in ("all", "*"):
+        error, status_id = resolve("status", status)
+        if error:
+            return format_response({"status_code": 0, "body": None, "error": error})
+        params["status_id"] = status_id
+
+    for name, kind, value in (("assigned_to_id", "user", assigned_to), ("tracker_id", "tracker", tracker),
+                              ("priority_id", "priority", priority)):
+        if value is None:
+            continue
+        error, resolved = resolve_user(value) if kind == "user" else resolve(kind, value)
+        if error:
+            return format_response({"status_code": 0, "body": None, "error": error})
+        params[name] = resolved
+
+    return wrap_insecure_content(format_response(request("issues.json", params=params)))
+
+
+@mcp.tool()
+def redmine_get_issue(issue_id: int, include: str = "journals,attachments,relations") -> str:
+    """Get a single issue with its notes, attachments and relations
+
+    Args:
+        issue_id: The issue id
+        include: Comma separated associations to include; pass '' for just the issue fields.
+                 Available: journals, attachments, relations, children, watchers, changesets
+
+    Returns:
+        str: YAML string containing response status code, body and error message
+    """
+    params = {"include": include} if include else None
+    return wrap_insecure_content(format_response(request(f"issues/{issue_id}.json", params=params)))
+
+
+@mcp.tool(description="""
+Create an issue
+
+Args:
+    subject: Issue title (required)
+    description: Issue body, supports the wiki/markdown syntax of the instance
+    project: {}
+    tracker: Tracker name or id, e.g. 'Bug'
+    priority: Priority name or id, e.g. 'High'
+    assigned_to: User id or 'me'
+    parent_issue_id: Parent issue id for subtasks
+    start_date: YYYY-MM-DD
+    due_date: YYYY-MM-DD
+    estimated_hours: Estimate in decimal hours
+    custom_fields: List of {{"id": int, "value": any}} for custom fields
+
+Returns:
+    str: YAML string containing response status code, body and error message
+""".format(PROJECT_NOTE).strip())
+def redmine_create_issue(subject: str, description: str = None, project: str = None, tracker: str = None,
+                         priority: str = None, assigned_to: str = None, parent_issue_id: int = None,
+                         start_date: str = None, due_date: str = None, estimated_hours: float = None,
+                         custom_fields: list = None) -> str:
+    project_id = resolve_project(project)
+    if not project_id:
+        return format_response({"status_code": 0, "body": None,
+                                "error": "No project given and REDMINE_PROJECT is not configured"})
+
+    issue = {"project_id": project_id, "subject": subject}
+    for key, value in (("description", description), ("parent_issue_id", parent_issue_id),
+                       ("start_date", start_date), ("due_date", due_date),
+                       ("estimated_hours", estimated_hours), ("custom_fields", custom_fields)):
+        if value is not None:
+            issue[key] = value
+
+    for key, kind, value in (("tracker_id", "tracker", tracker), ("priority_id", "priority", priority),
+                             ("assigned_to_id", "user", assigned_to)):
+        if value is None:
+            continue
+        error, resolved = resolve_user(value) if kind == "user" else resolve(kind, value)
+        if error:
+            return format_response({"status_code": 0, "body": None, "error": error})
+        issue[key] = resolved
+
+    return wrap_insecure_content(format_response(request("issues.json", method="post", data={"issue": issue})))
+
+
+@mcp.tool()
+def redmine_update_issue(issue_id: int, notes: str = None, subject: str = None, description: str = None,
+                         status: str = None, priority: str = None, assigned_to: str = None,
+                         done_ratio: int = None, due_date: str = None, private_notes: bool = False) -> str:
+    """Update an issue and/or add a note to it
+
+    Args:
+        issue_id: The issue id
+        notes: Comment to append to the issue journal
+        subject: New title
+        description: New body
+        status: Status name or id, e.g. 'Resolved'
+        priority: Priority name or id, e.g. 'High'
+        assigned_to: User id or 'me'
+        done_ratio: Percent done, 0-100
+        due_date: YYYY-MM-DD
+        private_notes: Mark the note as private
+
+    Returns:
+        str: YAML string containing response status code, body and error message
+    """
+    issue = {}
+    for key, value in (("notes", notes), ("subject", subject), ("description", description),
+                       ("done_ratio", done_ratio), ("due_date", due_date)):
+        if value is not None:
+            issue[key] = value
+
+    for key, kind, value in (("status_id", "status", status), ("priority_id", "priority", priority),
+                             ("assigned_to_id", "user", assigned_to)):
+        if value is None:
+            continue
+        error, resolved = resolve_user(value) if kind == "user" else resolve(kind, value)
+        if error:
+            return format_response({"status_code": 0, "body": None, "error": error})
+        issue[key] = resolved
+
+    if not issue:
+        return format_response({"status_code": 0, "body": None, "error": "Nothing to update"})
+    if private_notes and notes:
+        issue["private_notes"] = True
+
+    return format_response(request(f"issues/{issue_id}.json", method="put", data={"issue": issue}))
+
+
+@mcp.tool(description="""
+Log time on an issue or a project
+
+Args:
+    hours: Hours spent, decimal (required)
+    issue_id: Issue to log on. Either this or project must resolve to something
+    project: {}
+    activity: Activity name or id, e.g. 'Development'
+    comments: What was done
+    spent_on: YYYY-MM-DD, defaults to today on the Redmine side
+
+Returns:
+    str: YAML string containing response status code, body and error message
+""".format(PROJECT_NOTE).strip())
+def redmine_log_time(hours: float, issue_id: int = None, project: str = None, activity: str = None,
+                     comments: str = None, spent_on: str = None) -> str:
+    entry = {"hours": hours}
+    if issue_id is not None:
+        entry["issue_id"] = issue_id
+    elif project_id := resolve_project(project):
+        entry["project_id"] = project_id
+    else:
+        return format_response({"status_code": 0, "body": None,
+                                "error": "Give an issue_id or a project (or configure REDMINE_PROJECT)"})
+
+    for key, value in (("comments", comments), ("spent_on", spent_on)):
+        if value is not None:
+            entry[key] = value
+
+    if activity is not None:
+        error, activity_id = resolve("activity", activity)
+        if error:
+            return format_response({"status_code": 0, "body": None, "error": error})
+        entry["activity_id"] = activity_id
+
+    return format_response(request("time_entries.json", method="post", data={"time_entry": entry}))
+
+
+@mcp.tool()
+def redmine_list_projects(limit: int = 100) -> str:
+    """List the projects visible to the API user
+
+    Args:
+        limit: Max projects to return, capped at 100 (default 100)
+
+    Returns:
+        str: YAML string containing response status code, body and error message
+    """
+    response = request("projects.json", params={"limit": max(1, min(limit, 100))})
+    if response["status_code"] == 200 and isinstance(response["body"], dict):
+        # Trim to the fields needed to pick a project
+        response["body"] = {
+            "total_count": response["body"].get("total_count"),
+            "projects": [{k: p.get(k) for k in ("id", "identifier", "name")}
+                         for p in response["body"].get("projects", [])],
+        }
+
+    return wrap_insecure_content(format_response(response))
+
+
 def main():
     """Main entry point for the mcp-redmine package."""
     import argparse
     parser = argparse.ArgumentParser(description="MCP Redmine Server")
-    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio",
+    parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio",
                         help="Transport type (default: stdio)")
-    parser.add_argument("--host", default="0.0.0.0", help="Host for SSE transport (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8000, help="Port for SSE transport (default: 8000)")
+    parser.add_argument("--host", default="0.0.0.0", help="Host for HTTP transports (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8000, help="Port for HTTP transports (default: 8000)")
     args = parser.parse_args()
 
-    if args.transport == "sse":
+    if args.transport in ("sse", "streamable-http"):
         mcp.settings.host = args.host
         mcp.settings.port = args.port
     mcp.run(transport=args.transport)
