@@ -1,8 +1,6 @@
 # MCP Redmine
 
-**Status: Works great and is in daily use without any known bugs.**
-
-**Status2: I just added the package to PyPI and updated the usage instructions. Please report any issues :)**
+**Status: Maintained, in daily use.**
 
 Let Claude be your Redmine assistant! MCP Redmine connects Claude Desktop to your Redmine instance, allowing it to:
 
@@ -49,7 +47,7 @@ Add to your `claude_desktop_config.json`:
     "mcpServers": {
       "redmine": {
         "command": "uvx",
-        "args": ["--from", "mcp-redmine==2026.01.13.152335",
+        "args": ["--from", "mcp-redmine==2026.10.15.204909",
                 "--refresh-package", "mcp-redmine", "mcp-redmine"],
         "env": {
           "REDMINE_URL": "https://your-redmine-instance.example.com",
@@ -69,11 +67,16 @@ Ensure you have docker installed.
 docker --version
 ```
 
-Build docker image:
+Pull the published image from GitHub Container Registry:
+```bash
+docker pull ghcr.io/runekaagaard/mcp-redmine:latest
+```
+
+Or build the image yourself:
 ```bash
 git clone git@github.com:runekaagaard/mcp-redmine.git
 cd mcp-redmine
-docker build -t mcp-redmine .
+docker build -t ghcr.io/runekaagaard/mcp-redmine .
 ```
 Add to your `claude_desktop_config.json`:
   ```json
@@ -91,7 +94,7 @@ Add to your `claude_desktop_config.json`:
             "-e", "REDMINE_ALLOWED_DIRECTORIES",
             "-v", "/path/to/instructions.md:/app/INSTRUCTIONS.md",
             "-v", "/path/to/uploads:/app/uploads",
-            "mcp-redmine"
+            "ghcr.io/runekaagaard/mcp-redmine:latest"
         ],
         "env": {
           "REDMINE_URL": "https://your-redmine-instance.example.com",
@@ -104,18 +107,51 @@ Add to your `claude_desktop_config.json`:
   }
   ```
 
+### 3. Other MCP clients and transports
+
+MCP Redmine works with any MCP client (Claude Code, Cursor, IntelliJ-based IDEs, n8n, etc.) - point your
+client at the same command and environment variables as above, following your client's documentation for
+registering MCP servers.
+
+By default the server speaks stdio. For clients or setups that connect over HTTP, start the server with one
+of the HTTP transports:
+
+```bash
+# Recommended HTTP transport (serves on http://HOST:PORT/mcp)
+mcp-redmine --transport streamable-http --host 0.0.0.0 --port 8000
+
+# Legacy SSE transport, for older clients (serves on http://HOST:PORT/sse)
+mcp-redmine --transport sse --host 0.0.0.0 --port 8000
+```
+
+### Multi-user HTTP deployments
+
+When running as a shared HTTP server, each client can send its own Redmine API key in an
+`X-Redmine-API-Key` request header, so actions are attributed to the calling user instead
+of one shared service account. The header takes precedence; `REDMINE_API_KEY` remains the
+fallback (and the only option on stdio). Example with Claude Code:
+
+```bash
+claude mcp add --transport http --header "X-Redmine-API-Key: <your-personal-key>" \
+  redmine http://shared-server:8000/mcp
+```
+
+Only do this over trusted networks or TLS - the header carries a credential.
+
 ## Environment Variables
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `REDMINE_URL` | Yes | - | URL of your Redmine instance. Subpaths are supported (e.g., `http://localhost/redmine/`) |
-| `REDMINE_API_KEY` | Yes | - | Your Redmine API key (see below for how to get it) |
+| `REDMINE_API_KEY` | Yes* | - | Your Redmine API key (see below for how to get it). *Optional when every client sends `X-Redmine-API-Key` (see Multi-user below) |
 | `REDMINE_REQUEST_INSTRUCTIONS` | No | - | Path to a file containing additional instructions for the redmine_request tool. I've found it works great to have the LLM generate that file after a session. ([example1](INSTRUCTIONS_EXAMPLE1.md) [example2](INSTRUCTIONS_EXAMPLE2.md)) |
 | `REDMINE_HEADERS` | No | (empty) | Custom HTTP headers to include in all requests. Format: `"Header1: Value1, Header2: Value2"`. Useful for proxies that require additional authentication (e.g., `X-Redmine-Username`) |
 | `REDMINE_RESPONSE_FORMAT` | No | `yaml` | Response format: `yaml` or `json`. Controls how API responses are formatted |
 | `REDMINE_PROJECT` | No | (none) | Default project id or identifier for the curated tools. When set, `project` can be omitted on search/create/log-time; pass `project: "all"` to span every project |
 | `REDMINE_ALLOWED_DIRECTORIES` | For upload/download | (disabled) | **Required for file operations.** Comma-separated list of directories where upload/download are allowed (e.g., `/tmp,/home/user/uploads`). Upload/download are disabled if not set for security |
 | `REDMINE_DANGEROUSLY_ACCEPT_INVALID_CERTS` | No | (disabled) | Set to `1` to disable SSL certificate verification. Use only for self-signed certs in trusted environments |
+| `REDMINE_CA_BUNDLE` | No | (system CAs) | Path to a custom CA certificate bundle (e.g. `/path/to/ca.crt`) for Redmine instances using a private certificate chain. Prefer this over disabling verification |
+| `REDMINE_READ_ONLY` | No | (disabled) | Set to `1` to only allow GET requests. All writing operations (POST/PUT/DELETE, including uploads) are refused |
 
 > **Note**: When running via Docker, the `REDMINE_REQUEST_INSTRUCTIONS` environment variable must point to a **path inside the container**, not a path on the host machine.
 > Therefore, if you want to use a local file, you need to **mount it into the container** at the correct location.
@@ -206,13 +242,19 @@ they do not cover.
   error: ""
   ```
 
+- **redmine_attachment_image**
+  - Fetch an image attachment (e.g. an inline screenshot referenced as `!screenshot.png!` in an issue
+    description) and return it as viewable image content, letting the LLM actually see it
+  - Input: `attachment_id` (integer)
+  - Returns image content on success (max 5 MB, images only), or a YAML error string on failure
+
 - **redmine_download**
   - Download an attachment from Redmine and save it to a local file
   - **Requires `REDMINE_ALLOWED_DIRECTORIES` to be set**
   - Inputs:
     - `attachment_id` (integer): The ID of the attachment to download
-    - `save_path` (string): Fully qualified path where the file should be saved (must be within allowed directories)
-    - `filename` (string, optional): Optional filename to use (determined automatically if not provided)
+    - `save_path` (string): Fully qualified file path (not directory) where the file should be saved (must be within allowed directories)
+    - `filename` (string, optional): Optional filename for the Redmine download URL (determined automatically from attachment metadata if not provided)
   - Returns YAML string with download results:
   ```yaml
   status_code: 200
@@ -283,6 +325,7 @@ Then set this in claude_desktop_config.json:
 
 - **[MCP Alchemy](https://github.com/runekaagaard/mcp-alchemy)** - Connect Claude Desktop to databases for exploring schema and running SQL.
 - **[MCP Notmuch Sendmail](https://github.com/runekaagaard/mcp-notmuch-sendmail)** - Email assistant for Claude Desktop using notmuch.
+- **[MCP Show-on-Kindle](https://github.com/runekaagaard/mcp-show-on-kindle)** - Copy a file to a Kindle running KOReader and open it on screen.
 - **[Diffpilot](https://github.com/runekaagaard/diffpilot)** - Multi-column git diff viewer with file grouping and tagging.
 - **[Claude Local Files](https://github.com/runekaagaard/claude-local-files)** - Access local files in Claude Desktop artifacts.
 
